@@ -1,0 +1,20 @@
+# Browser profile - DO NOT PUSH
+/browser_profile/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Environment variables / secrets
+.env
+
+# Generated output
+output/
+
+# IDE / editor files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
