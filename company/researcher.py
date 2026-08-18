@@ -167,7 +167,7 @@ class Researcher:
             "industry", "sector", "founded", "founded year",
             "established", "incorporated", "employees", "employees count",
             "employee count", "headcount", "head count", "company size",
-            "headquarters", "indian address", "address", "contact number",
+            "headquarters", "indian address", "address", "location", "locations", "contact number",
             "phone", "mobile", "email", "website", "linkedin",
         )
         label_alt = "|".join(re.escape(x) for x in labels)
@@ -192,6 +192,8 @@ class Researcher:
                 "headquarters": "address",
                 "indian address": "address",
                 "address": "address",
+                "location": "address",
+                "locations": "address",
                 "contact number": "phone",
                 "phone": "phone",
                 "mobile": "phone",
@@ -507,9 +509,9 @@ class Researcher:
         #
         # If Search Assist says no relevant information, the page is reloaded
         # once and the complete interaction is repeated.
-        if not d["industry"] or not d["sector"]:
+        if not d["industry"] or not d["sector"] or not d["address"]:
             self.log(
-                "      [Industry/Sector] Mandatory DuckDuckGo company-profile research"
+                "      [Industry/Sector/Address] Mandatory DuckDuckGo company-profile research"
             )
 
             gp = await self.context.new_page()
@@ -687,6 +689,17 @@ class Researcher:
                             d["year"] = m.group(1)
                             d["sources"].append("year:duckduckgo:explicit-snippet")
 
+                    if not d["address"]:
+                        m = re.search(
+                            r"(?im)^\s*(?:[-•]\s*)?(?:Headquarters|Address|Indian Address|Location)\s*:\s*(.+?)\s*$",
+                            evidence,
+                        )
+                        if m:
+                            candidate = self._clean_profile_value(m.group(1))
+                            if len(candidate) > 5:
+                                d["address"] = candidate[:500]
+                                d["sources"].append("address:duckduckgo:explicit-snippet")
+
                 self._sanitize_classification(d)
 
                 self.log(
@@ -694,6 +707,9 @@ class Researcher:
                 )
                 self.log(
                     f"         DuckDuckGo Sector: {d['sector'] or 'NOT FOUND'}"
+                )
+                self.log(
+                    f"         DuckDuckGo Address: {d['address'] or 'NOT FOUND'}"
                 )
 
                 if assist:
@@ -715,6 +731,10 @@ class Researcher:
                 self.log(
                     f"         DuckDuckGo Sector: "
                     f"{d['sector'] or 'NOT FOUND'}"
+                )
+                self.log(
+                    f"         DuckDuckGo Address: "
+                    f"{d['address'] or 'NOT FOUND'}"
                 )
 
                 if assist:

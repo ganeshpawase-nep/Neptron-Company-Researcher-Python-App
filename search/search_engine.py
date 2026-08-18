@@ -749,8 +749,8 @@ class DuckDuckGoSearch:
 
                 status, current = await self._wait_for_assist_answer(
                     page,
-                    timeout_ms=max(90000, int(
-                        getattr(self.settings, "search_assist_max_wait_ms", 90000)
+                    timeout_ms=max(35000, int(
+                        getattr(self.settings, "search_assist_max_wait_ms", 35000)
                     )),
                 )
 
@@ -769,8 +769,8 @@ class DuckDuckGoSearch:
 
                     expanded = await self._wait_for_expanded_profile(
                         page,
-                        timeout_ms=max(90000, int(
-                            getattr(self.settings, "search_assist_expanded_wait_ms", 120000)
+                        timeout_ms=max(35000, int(
+                            getattr(self.settings, "search_assist_expanded_wait_ms", 35000)
                         )),
                     )
 
