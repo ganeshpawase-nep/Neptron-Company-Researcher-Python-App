@@ -22,13 +22,13 @@ class Settings:
     industry_search_results: int = int(os.getenv("INDUSTRY_SEARCH_RESULTS", "8"))
     industry_search_timeout_ms: int = int(os.getenv("INDUSTRY_SEARCH_TIMEOUT_MS", "18000"))
     # Required DDG Search Assist interaction timing.
-    search_assist_open_wait_ms: int = int(os.getenv("SEARCH_ASSIST_OPEN_WAIT_MS", "15000"))
+    search_assist_open_wait_ms: int = int(os.getenv("SEARCH_ASSIST_OPEN_WAIT_MS", "2000"))
     # Adaptive Search Assist waits. These are maximum safety ceilings, not fixed sleeps.
-    search_assist_max_wait_ms: int = int(os.getenv("SEARCH_ASSIST_MAX_WAIT_MS", "90000"))
-    search_assist_expanded_wait_ms: int = int(os.getenv("SEARCH_ASSIST_EXPANDED_WAIT_MS", "120000"))
+    search_assist_max_wait_ms: int = int(os.getenv("SEARCH_ASSIST_MAX_WAIT_MS", "20000"))
+    search_assist_expanded_wait_ms: int = int(os.getenv("SEARCH_ASSIST_EXPANDED_WAIT_MS", "20000"))
     company_timeout_ms: int = int(os.getenv("COMPANY_TIMEOUT_MS", "360000"))
     candidate_navigation_attempts: int = int(os.getenv("CANDIDATE_NAVIGATION_ATTEMPTS", "3"))
-    industry_sector_timeout_ms: int = int(os.getenv("INDUSTRY_SECTOR_TIMEOUT_MS", "300000"))
+    industry_sector_timeout_ms: int = int(os.getenv("INDUSTRY_SECTOR_TIMEOUT_MS", "90000"))
     linkedin_login_enabled: bool = b(os.getenv("LINKEDIN_LOGIN_ENABLED", "true"))
 
     # Production default: company tabs are closed after every company.

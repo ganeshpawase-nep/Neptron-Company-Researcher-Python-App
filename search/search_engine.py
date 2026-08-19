@@ -59,7 +59,15 @@ class DuckDuckGoSearch:
             except Exception:
                 context = None
 
-        if context is None or context.is_closed():
+        if context is None:
+            raise RuntimeError(
+                "DuckDuckGo search page is closed and its browser context is unavailable."
+            )
+
+        # BrowserContext does not have is_closed(); probe with a lightweight op.
+        try:
+            _ = context.pages
+        except Exception:
             raise RuntimeError(
                 "DuckDuckGo search page is closed and its browser context is unavailable."
             )
@@ -115,7 +123,132 @@ class DuckDuckGoSearch:
 
         # Let the result UI mount before looking for Search Assist.
         await page.wait_for_timeout(1500)
+
+        # Dismiss the introductory Search Assist popup if it appears.
+        await self._dismiss_search_assist_popup(page)
+
         return page
+
+    async def _dismiss_search_assist_popup(self, page):
+        """Dismiss the DuckDuckGo Search Assist introductory/welcome popup if present.
+
+        DuckDuckGo shows a one-time modal explaining what Search Assist is.
+        This modal blocks interaction with the actual Search Assist card and
+        must be closed before the automation can proceed.
+
+        The popup contains text like:
+          - "Search Assist is an optional feature that anonymously generates
+            answers for search queries"
+          - "scans the web for relevant content"
+          - "Search Settings"
+        And has a close button (× icon) in the top-right corner.
+        """
+        for attempt in range(3):
+            try:
+                dismissed = await page.evaluate(r"""() => {
+                    // Look for modal/dialog/overlay containing Search Assist intro text
+                    const allEls = document.querySelectorAll('*');
+                    for (const el of allEls) {
+                        const text = (el.innerText || '').trim();
+                        const r = el.getBoundingClientRect();
+                        // Skip tiny or page-sized elements
+                        if (r.width < 150 || r.height < 100) continue;
+                        // Skip elements larger than a modal popup
+                        if (r.width > 900 && r.height > 800) continue;
+                        // Must contain the intro/explanation text about Search Assist
+                        const isIntroPopup = (
+                            /optional feature/i.test(text) ||
+                            (/anonymously/i.test(text) && /generates/i.test(text)) ||
+                            (/scans the web/i.test(text) && /Search Assist/i.test(text))
+                        );
+                        if (!isIntroPopup) continue;
+
+                        // Found the intro popup — try every strategy to close it
+
+                        // Strategy 1: aria-label close/dismiss button
+                        const closeByAria = el.querySelector(
+                            '[aria-label*="close" i], [aria-label*="dismiss" i], ' +
+                            '[aria-label*="Close" i], [aria-label*="Dismiss" i]'
+                        );
+                        if (closeByAria) { closeByAria.click(); return 'closed-via-aria'; }
+
+                        // Strategy 2: Any clickable with × / X / ✕ / close text
+                        const clickables = el.querySelectorAll(
+                            'button, [role="button"], a, span[tabindex], div[tabindex]'
+                        );
+                        for (const b of clickables) {
+                            const bt = (b.innerText || b.textContent || '').trim();
+                            if (/^[\u00d7\u2715\u2716\u2717\u2718Xx]$/.test(bt) || /^close$/i.test(bt)) {
+                                b.click(); return 'closed-via-text';
+                            }
+                        }
+
+                        // Strategy 3: SVG close icon (small clickable with SVG)
+                        for (const b of clickables) {
+                            const br = b.getBoundingClientRect();
+                            if (b.querySelector('svg') && br.width < 60 && br.height < 60 &&
+                                br.top >= r.top && br.top <= r.top + 80) {
+                                b.click(); return 'closed-via-svg';
+                            }
+                        }
+
+                        // Strategy 4: Look for close button OUTSIDE the popup (sibling/parent)
+                        const parent = el.parentElement;
+                        if (parent) {
+                            const siblingBtns = parent.querySelectorAll(
+                                'button, [role="button"]'
+                            );
+                            for (const b of siblingBtns) {
+                                const bt = (b.innerText || b.textContent || '').trim();
+                                const ba = (b.getAttribute('aria-label') || '').trim();
+                                if (/^[\u00d7\u2715Xx]$/.test(bt) || /close|dismiss/i.test(ba)) {
+                                    b.click(); return 'closed-via-parent';
+                                }
+                            }
+                        }
+
+                        return 'found-but-no-close-button';
+                    }
+                    return null;
+                }""")
+
+                if dismissed and dismissed != 'found-but-no-close-button':
+                    self.log(f"         Dismissed Search Assist intro popup ({dismissed}).")
+                    await page.wait_for_timeout(500)
+                    return True
+
+                if dismissed == 'found-but-no-close-button':
+                    # Popup found but no close button matched — try Escape key
+                    self.log("         Search Assist intro popup found; trying Escape key...")
+                    await page.keyboard.press("Escape")
+                    await page.wait_for_timeout(500)
+
+                    # Check if popup is gone
+                    still_present = await page.evaluate(r"""() => {
+                        const allEls = document.querySelectorAll('*');
+                        for (const el of allEls) {
+                            const text = (el.innerText || '').trim();
+                            const r = el.getBoundingClientRect();
+                            if (r.width < 150 || r.height < 100 || (r.width > 900 && r.height > 800)) continue;
+                            if (/optional feature/i.test(text) || (/scans the web/i.test(text) && /Search Assist/i.test(text)))
+                                return true;
+                        }
+                        return false;
+                    }""")
+                    if not still_present:
+                        self.log("         Dismissed Search Assist intro popup (closed-via-escape).")
+                        return True
+                    # Try clicking outside the popup to dismiss it
+                    self.log("         Escape did not close popup; clicking outside...")
+                    await page.mouse.click(50, 50)
+                    await page.wait_for_timeout(500)
+                    continue
+                else:
+                    # No popup found at all
+                    return False
+            except Exception as exc:
+                self.log(f"         Popup dismissal attempt {attempt+1} error: {type(exc).__name__}")
+        return False
 
     async def _visible_text_click(self, page, label_regex, timeout_ms=15000):
         """
@@ -158,124 +291,87 @@ class DuckDuckGoSearch:
 
         return False
 
-    async def _assist_card_open(self, page):
-        """Return True when a real Search Assist answer card is visibly open.
-
-        The top navigation control also contains the words ``Search Assist``.
-        Full-page container elements (body, main, large wrappers) also contain
-        that text in their ``innerText`` because it appears in the nav bar.
-
-        To avoid false positives we require:
-          - "Search Assist" appears within the first 200 characters of the
-            element's text (the card puts it as a heading at the top).
-          - The element is NOT the entire page (height < 800 px).
-          - The element has substantial content (> 120 chars).
-        """
-        try:
-            blocks = await page.evaluate(
-                """() => {
-                    const els = document.querySelectorAll('div,section,article');
-                    const results = [];
-                    for (const e of els) {
-                        // Reject containers that include the main search input
-                        if (e.querySelector('input[name="q"]')) continue;
-
-                        const text = (e.innerText || '').trim();
-                        if (!text || text.length < 120 || text.length > 12000) continue;
-                        const r = e.getBoundingClientRect();
-                        // Must be a moderately sized panel, NOT the full page
-                        if (r.width < 250 || r.height < 80 || r.height > 800) continue;
-                        // "Search Assist" must be near the TOP of the element
-                        const pos = text.toLowerCase().indexOf('search assist');
-                        if (pos < 0 || pos > 200) continue;
-                        results.push(true);
-                    }
-                    return results;
-                }"""
-            )
-            return bool(blocks)
-        except Exception:
-            return False
-
     async def _click_search_assist(self, page, timeout_ms=30000):
-        """Ensure the Search Assist card is visible on the page.
+        """Click the Search Assist nav button using raw physical mouse at exact pixel coordinates.
 
-        DDG often renders the Search Assist card automatically when it has an
-        answer.  This method first checks whether the card is already open.
-        If it is, it returns True immediately without clicking anything —
-        preventing the old bug where clicking the nav-bar "Search Assist"
-        link would toggle the already-open card closed.
-
-        Only when the card is NOT already visible does it attempt to click
-        the Search Assist control in the navigation bar.
+        Strategy:
+          1. Wait 5 seconds for the page to fully render.
+          2. Use JavaScript to find the exact <A> tag whose href contains 'assist=true'.
+          3. Get that element's center pixel coordinates.
+          4. Use raw page.mouse.move/down/up to physically click at those exact coordinates.
+          5. If no <A> tag found, fall back to finding any small element with 'Search Assist' text.
         """
+        # Wait exactly 5 seconds for page to fully render
+        try:
+            await page.wait_for_timeout(5000)
+        except Exception:
+            pass
+
+        self.log("         Waiting 5s completed. Attempting to click Search Assist...")
+
         deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
 
-        # ── 1. Fast check: is the card already rendered? ──────────────
-        for _ in range(6):
-            if await self._assist_card_open(page):
-                self.log("         Search Assist card is already open — skipping click.")
-                return True
-            try:
-                await page.wait_for_timeout(500)
-            except Exception:
-                break
-
-        # ── 2. Card not visible — try clicking the nav-bar control ────
-        # DDG renders the nav button with a leading icon character (e.g. ✦ or ⚡)
-        # so we must NOT anchor the regex with ^ — just match "Search Assist"
-        # anywhere in the element text.
-        clicked = False
         while asyncio.get_running_loop().time() < deadline:
-            candidates = [
-                # Prefer the navigation-bar link/button containing "Search Assist"
-                page.locator("a, button, [role='button'], [role='link']").filter(
-                    has_text=re.compile(r"Search\s+Assist", re.I)
-                ),
-                page.get_by_role("button", name=re.compile(r"Search\s+Assist", re.I)),
-                page.get_by_role("link", name=re.compile(r"Search\s+Assist", re.I)),
-                page.get_by_text(re.compile(r"Search\s+Assist", re.I)),
-            ]
+            # Use JavaScript to find the EXACT clickable element and its center coordinates
+            coords = await page.evaluate("""() => {
+                // Strategy 1: Find the <A> tag with assist=true in href (most reliable)
+                const links = document.querySelectorAll('a');
+                for (const a of links) {
+                    const href = a.getAttribute('href') || '';
+                    if (href.includes('assist=true')) {
+                        const r = a.getBoundingClientRect();
+                        if (r.width > 0 && r.height > 0) {
+                            return {
+                                x: Math.round(r.x + r.width / 2),
+                                y: Math.round(r.y + r.height / 2),
+                                method: 'href-assist-true'
+                            };
+                        }
+                    }
+                }
 
-            for locator in candidates:
-                try:
-                    count = await locator.count()
-                except Exception:
-                    continue
+                // Strategy 2: Find small elements whose own text is exactly "Search Assist"
+                const all = document.querySelectorAll('a, button, span, li, div');
+                for (const el of all) {
+                    const r = el.getBoundingClientRect();
+                    // Must be a small, visible element in the nav area (not a wrapper)
+                    if (r.width < 30 || r.width > 200 || r.height < 10 || r.height > 50) continue;
+                    if (r.top < 0 || r.top > 150) continue;  // nav bar is near the top
 
-                for i in range(min(count, 8)):
-                    item = locator.nth(i)
-                    try:
-                        if not await item.is_visible() or not await item.is_enabled():
-                            continue
-                        await item.scroll_into_view_if_needed(timeout=2000)
-                        await item.click(timeout=5000)
-                        clicked = True
-                        break
-                    except Exception:
-                        continue
-                if clicked:
-                    break
+                    const text = (el.innerText || '').trim();
+                    if (/^(\\S+\\s+)?Search\\s+Assist$/i.test(text)) {
+                        return {
+                            x: Math.round(r.x + r.width / 2),
+                            y: Math.round(r.y + r.height / 2),
+                            method: 'text-match'
+                        };
+                    }
+                }
 
-            if clicked:
-                # Let DDG mount the card.  Do NOT click again.
-                for _ in range(16):
-                    if await self._assist_card_open(page):
-                        self.log("         Search Assist opened after clicking nav control.")
-                        return True
-                    try:
-                        await page.wait_for_timeout(500)
-                    except Exception:
-                        return False
+                return null;
+            }""")
 
-                self.log("         Search Assist click registered, but the answer card did not stay open.")
-                return False
+            if coords:
+                self.log(f"         Found Search Assist at ({coords['x']}, {coords['y']}) via {coords['method']}")
 
+                # Raw physical mouse click at exact pixel coordinates
+                await page.mouse.move(coords['x'], coords['y'])
+                await asyncio.sleep(0.2)
+                await page.mouse.down()
+                await asyncio.sleep(0.1)
+                await page.mouse.up()
+
+                self.log("         Search Assist physically clicked.")
+                return True
+
+            # Not found yet, wait and retry
+            self.log("         Search Assist button not found yet, retrying...")
             try:
-                await page.wait_for_timeout(400)
+                await page.wait_for_timeout(1000)
             except Exception:
                 return False
 
+        self.log("         Search Assist button not found within timeout.")
         return False
 
     async def _find_more_button(self, page):
@@ -337,6 +433,16 @@ class DuckDuckGoSearch:
                         if (r.width < 300 || r.height < 80 || r.height > 800) continue;
                         const pos = text.toLowerCase().indexOf('search assist');
                         if (pos < 0 || pos > 200) continue;
+                        // Exclude the intro/welcome popup
+                        const low = text.toLowerCase();
+                        if (low.includes('optional feature') ||
+                            low.includes('anonymously generates') ||
+                            (low.includes('scans the web') && low.includes('search settings'))) continue;
+                        // Exclude the DDG navigation bar
+                        const head = low.slice(0, 300);
+                        const navTerms = ['images', 'videos', 'news', 'maps'];
+                        const navHits = navTerms.filter(t => head.includes(t)).length;
+                        if (navHits >= 3) continue;
                         if (!best || text.length < best.textLen)
                             best = {x: r.x, y: r.y, width: r.width, height: r.height, bottom: r.bottom, textLen: text.length};
                     }
@@ -376,6 +482,8 @@ class DuckDuckGoSearch:
                         if (/^search$/i.test(aria) || /^search$/i.test(txt)) continue;
                         // Skip info/about buttons (the (i) icon)
                         if (/^info$|^about$|^information$/i.test(aria)) continue;
+                        // Skip the intro popup's "Learn More About Assist" button
+                        if (/learn more|about assist|optional feature/i.test(combined)) continue;
 
                         const isLikely =
                             expanded === 'false' ||
@@ -414,7 +522,13 @@ class DuckDuckGoSearch:
                     if not await item.is_visible():
                         continue
                     await item.scroll_into_view_if_needed(timeout=2000)
-                    await item.click(timeout=5000)
+                    
+                    # Human-like click requested by user
+                    await item.hover(timeout=2000)
+                    await page.mouse.down()
+                    await asyncio.sleep(0.1)
+                    await page.mouse.up()
+                    
                     self.log(
                         f"         Clicked expand arrow (text={c.get('txt','')!r}, "
                         f"aria={c.get('aria','')!r}, svg={c.get('hasSvg',False)})"
@@ -427,7 +541,7 @@ class DuckDuckGoSearch:
             self.log(f"         Expand-arrow detection error: {type(exc).__name__}: {str(exc)[:120]}")
         return False
 
-    async def _click_more(self, page, timeout_ms=60000):
+    async def _click_more(self, page, timeout_ms=20000):
         """Expand the Search Assist card (arrow), then click More.
 
         Sequence:
@@ -443,7 +557,13 @@ class DuckDuckGoSearch:
             if more is not None:
                 try:
                     await more.scroll_into_view_if_needed(timeout=2000)
-                    await more.click(timeout=5000)
+                    
+                    # Human-like click requested by user
+                    await more.hover(timeout=2000)
+                    await page.mouse.down()
+                    await asyncio.sleep(0.1)
+                    await page.mouse.up()
+                    
                     self.log("         'More' button clicked successfully.")
                     return True
                 except Exception:
@@ -451,8 +571,11 @@ class DuckDuckGoSearch:
 
             # Only try the arrow once per Search Assist open cycle.
             if not arrow_clicked:
-                arrow_clicked = await self._click_expand_arrow_if_needed(page)
-                if arrow_clicked:
+                result = await self._click_expand_arrow_if_needed(page)
+                # Mark as attempted regardless of success to prevent
+                # spamming retries when no arrow exists on the page.
+                arrow_clicked = True
+                if result:
                     # Give DDG time to render the expanded section + More button
                     try:
                         await page.wait_for_timeout(2000)
@@ -475,11 +598,11 @@ class DuckDuckGoSearch:
         except Exception:
             return ""
 
-    async def _wait_for_assist_answer(self, page, timeout_ms=90000):
+    async def _wait_for_assist_answer(self, page, timeout_ms=30000):
         """Wait for the Search Assist card to stabilize, expand it, then click More.
 
         Sequence:
-          1. Wait a configurable period (default 15 s) for the card to render.
+          1. Wait a configurable period (default 2 s) for the card to render.
           2. Try the expand arrow → More flow via ``_click_more``.
           3. If More is clicked successfully, return ``("more", ...)``.
           4. If the card says "no relevant information", return ``("empty", ...)``.
@@ -500,7 +623,7 @@ class DuckDuckGoSearch:
             return "empty", text
 
         # _click_more handles: arrow click → wait → More click.
-        if await self._click_more(page, timeout_ms=max(30000, timeout_ms)):
+        if await self._click_more(page, timeout_ms=max(20000, timeout_ms)):
             return "more", text or ""
 
         # More never appeared. Return whatever text we have.
@@ -526,15 +649,43 @@ class DuckDuckGoSearch:
                     const candidates = [];
                     for (const e of els) {
                         const text=(e.innerText||'').trim();
-                        // Accept cards with Company Profile OR General Information OR explicit Industry/Sector labels
-                        const hasProfile = /company profile/i.test(text) || /general information/i.test(text);
-                        const hasLabels = /\bIndustry\s*:/i.test(text) || /\bSector\s*:/i.test(text);
-                        if (!hasProfile && !hasLabels) continue;
                         const r=e.getBoundingClientRect();
                         if (r.width < 250 || r.height < 100 || text.length < 150 || text.length > 30000) continue;
-                        candidates.push({e,text,len:text.length});
+                        
+                        const low = text.toLowerCase();
+                        // Must actually be the Search Assist card!
+                        const pos = low.indexOf('search assist');
+                        if (pos < 0 || pos > 200) continue;
+                        
+                        // Exclude the DDG navigation bar.
+                        const head = low.slice(0, 300);
+                        const navTerms = ['images', 'videos', 'news', 'maps'];
+                        const navHits = navTerms.filter(t => head.includes(t)).length;
+                        if (navHits >= 3) continue;
+                        
+                        // Exclude the main search results wrapper.
+                        if (e.querySelectorAll('article').length > 1) continue;
+                        if (e.querySelectorAll('[data-testid="result"]').length > 1) continue;
+                        
+                        // Look for Company Profile markers
+                        const hasProfile = /company profile/i.test(text) || /general information/i.test(text);
+                        const hasLabels = /\bIndustry\b/i.test(text) && (/\bSector\b/i.test(text) || /Founded|Employees|Headquarters/i.test(text));
+                        const hasSearchAssist = low.indexOf('search assist') >= 0 && low.indexOf('search assist') < 200;
+
+                        if (!hasProfile && !hasLabels && !hasSearchAssist) continue;
+                        
+                        candidates.push({e, text, len: text.length, hasLabels, hasSearchAssist});
                     }
-                    candidates.sort((a,b)=>a.len-b.len);
+                    
+                    // Prefer elements that definitely have labels or the exact Search Assist header
+                    candidates.sort((a, b) => {
+                        let scoreA = (a.hasLabels ? 2 : 0) + (a.hasSearchAssist ? 1 : 0);
+                        let scoreB = (b.hasLabels ? 2 : 0) + (b.hasSearchAssist ? 1 : 0);
+                        if (scoreA !== scoreB) return scoreB - scoreA;
+                        // Otherwise prefer the smaller containing element
+                        return a.len - b.len;
+                    });
+                    
                     if (!candidates.length) return [];
                     const e=candidates[0].e;
                     const out=[];
@@ -547,7 +698,8 @@ class DuckDuckGoSearch:
                     });
                     e.querySelectorAll('li').forEach(li=>{
                         const t=(li.innerText||'').trim();
-                        if(/^(Industry|Sectors?(?:\s+Served)?|Founded|Established|Employees|Employee Count|Company Size|Headquarters|Address|Email|Website|LinkedIn|Phone|Mobile)\s*:/i.test(t)) {
+                        // Allow leading bullets, dashes, spaces before the label
+                        if(/^[\s\-\•\*]*(Industry|Sectors?(?:\s+Served)?|Founded|Established|Employees|Employee Count|Company Size|Headquarters|Address|Email|Website|LinkedIn|Phone|Mobile)\s*:/i.test(t)) {
                             // Sub-lists render as newlines. Convert to comma-separated.
                             push(t.replace(/\n+/g, ', '));
                         }
@@ -566,7 +718,7 @@ class DuckDuckGoSearch:
         except Exception:
             return ""
 
-    async def _wait_for_expanded_profile(self, page, timeout_ms=120000):
+    async def _wait_for_expanded_profile(self, page, timeout_ms=35000):
         """Wait until the expanded Company Profile is rendered and stable."""
         deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
         previous = ""
@@ -583,19 +735,21 @@ class DuckDuckGoSearch:
                 stable_count = 0
             previous = normalized
 
-            has_industry = bool(re.search(r"(?:^|\n)Industry(?:\s*:)?\s*$|(?:^|\n)Industry\s*:", current or "", re.I | re.M))
-            has_sector = bool(re.search(r"(?:^|\n)Sector(?:\s*:)?\s*$|(?:^|\n)Sector\s*:", current or "", re.I | re.M))
+            # Allow leading bullets, dashes, or whitespace before the labels
+            has_industry = bool(re.search(r"(?:^|\n)[\s\-\•\*]*Industry(?:\s*:)?\s*$|(?:^|\n)[\s\-\•\*]*Industry\s*:", current or "", re.I | re.M))
+            has_sector = bool(re.search(r"(?:^|\n)[\s\-\•\*]*Sector(?:\s*:)?\s*$|(?:^|\n)[\s\-\•\*]*Sector\s*:", current or "", re.I | re.M))
 
             # The presence of explicit Industry/Sector labels is sufficient
-            # proof the expanded profile has loaded.  Do NOT require the
-            # heading text ("Company Profile" / "General Information")
-            # because the extraction JS returns only table rows / list
-            # items — headings are <h3>/<h4> tags and are never included
-            # in the extracted text.
+            # proof the expanded profile has loaded.
             if current and (has_industry or has_sector):
                 last_good = current
-                if stable_count >= 2:
+                if has_industry and has_sector:
                     return current
+                if stable_count >= 1:
+                    return current
+            elif current and stable_count == 0:
+                # Log the extracted text so we can see what's being rejected
+                self.log(f"         [DEBUG] extracted text: {repr(current[:300])}")
 
             if "sorry, no relevant information was found" in normalized.lower():
                 return ""
@@ -735,9 +889,12 @@ class DuckDuckGoSearch:
                 # nav controls, etc.) before attempting any interaction.
                 await page.wait_for_timeout(2000)
 
+                # Dismiss the introductory Search Assist popup if it appears.
+                await self._dismiss_search_assist_popup(page)
+
                 clicked = await self._click_search_assist(
                     page,
-                    timeout_ms=30000,
+                    timeout_ms=15000,
                 )
 
                 if not clicked:
@@ -749,8 +906,8 @@ class DuckDuckGoSearch:
 
                 status, current = await self._wait_for_assist_answer(
                     page,
-                    timeout_ms=max(35000, int(
-                        getattr(self.settings, "search_assist_max_wait_ms", 35000)
+                    timeout_ms=max(20000, int(
+                        getattr(self.settings, "search_assist_max_wait_ms", 30000)
                     )),
                 )
 
@@ -761,15 +918,18 @@ class DuckDuckGoSearch:
                         "         Search Assist 'More' was clicked by the wait handler."
                     )
 
-                    self.log(
-                        "         Waiting for expanded profile to render..."
-                    )
-                    # We removed the random 15-25s sleep here because
-                    # _wait_for_expanded_profile does its own efficient polling.
+                    # Add random 10-15s wait before polling to ensure DDG AI has time to generate the answer.
+                    import random
+                    wait_secs = random.uniform(10.0, 15.0)
+                    self.log(f"         Waiting {wait_secs:.1f}s for expanded profile to render...")
+                    try:
+                        await page.wait_for_timeout(int(wait_secs * 1000))
+                    except Exception:
+                        pass
 
                     expanded = await self._wait_for_expanded_profile(
                         page,
-                        timeout_ms=max(35000, int(
+                        timeout_ms=max(20000, int(
                             getattr(self.settings, "search_assist_expanded_wait_ms", 35000)
                         )),
                     )
@@ -843,10 +1003,16 @@ class DuckDuckGoSearch:
         Reload/recreate the DuckDuckGo tab after a failed Search Assist attempt.
 
         The next attempt deliberately starts the complete flow again: open query
-        -> click Search Assist -> wait 15s -> More -> wait 15-25s.
+        -> click Search Assist -> wait -> More -> expanded profile.
         """
         try:
-            if page and not page.is_closed():
+            page_alive = False
+            try:
+                page_alive = page is not None and not page.is_closed()
+            except Exception:
+                pass
+
+            if page_alive:
                 self.log("         Reloading DuckDuckGo Search Assist page...")
                 await page.reload(
                     wait_until="domcontentloaded",
