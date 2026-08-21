@@ -5,7 +5,7 @@ from urllib.parse import quote_plus, urljoin
 
 from models.company import CompanyResearchResult
 from company.normalizer import normalize_text, tokens
-from company.scoring import score_candidate, source_kind, host, root, is_linkedin
+from company.scoring import score_candidate, source_kind, host, root, is_linkedin, IGNORED_HOSTS
 from search.search_engine import DuckDuckGoSearch
 
 EMAIL_RE = re.compile(r"\b[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\b")
@@ -349,7 +349,13 @@ class Researcher:
         d = {
             "about": "", "industry": "", "sector": "", "revenue": "",
             "year": "", "employees": "", "emails": [], "phones": [],
-            "address": "", "contact": "", "sources": []
+            "address": "", "contact": "", "sources": [],
+            "website_from_search_assist": "",
+            "website_from_linkedin": "",
+            "emails_from_search_assist": [],
+            "phones_from_search_assist": [],
+            "emails_from_linkedin": [],
+            "phones_from_linkedin": [],
         }
 
         # ---------------- WEBSITE ----------------
@@ -630,12 +636,31 @@ class Researcher:
                             "phone:duckduckgo:search-assist-expanded",
                         )
 
-                    # Search Assist website/LinkedIn are fallback references,
-                    # never replacements for a verified company URL.
+                    # Search Assist website/LinkedIn — store as authoritative sources.
+                    if profile["website"]:
+                        sa_website = profile["website"].rstrip(".,);")
+                        # Only use if it's not a third-party aggregator
+                        sa_host = host(sa_website) if sa_website.startswith("http") else sa_website
+                        if not any(sa_host == x or sa_host.endswith("." + x) for x in IGNORED_HOSTS):
+                            d["website_from_search_assist"] = sa_website
+                            self.log(f"         Search Assist official website: {sa_website}")
                     if not linkedin and profile["linkedin"]:
                         linkedin = profile["linkedin"].rstrip(".,);")
                     if not d.get("website_fallback") and profile["website"]:
                         d["website_fallback"] = profile["website"].rstrip(".,);")
+
+                    # Store Search Assist emails/phones separately for priority override
+                    if profile["email"]:
+                        for email in EMAIL_RE.findall(profile["email"]):
+                            cleaned = email.lower().rstrip(".,;")
+                            if cleaned not in d["emails_from_search_assist"]:
+                                d["emails_from_search_assist"].append(cleaned)
+                    if profile["phone"]:
+                        phone_digits = re.sub(r"\D", "", profile["phone"])
+                        if 8 <= len(phone_digits) <= 15:
+                            cleaned_phone = re.sub(r"\s+", " ", profile["phone"]).strip()
+                            if cleaned_phone not in d["phones_from_search_assist"]:
+                                d["phones_from_search_assist"].append(cleaned_phone)
 
                     if not d["about"]:
                         m = re.search(
@@ -757,6 +782,118 @@ class Researcher:
                         await asyncio.wait_for(gp.close(), timeout=5)
                 except Exception:
                     pass
+
+        # ---- WEBSITE OVERRIDE: Prefer Search Assist / LinkedIn official website ----
+        #
+        # Priority chain:
+        #   1. Search Assist Website: field (highest — structured data from DDG)
+        #   2. LinkedIn Website field (second — from company's own LinkedIn page)
+        #   3. DuckDuckGo verified website (current selection)
+        #
+        override_website = ""
+        override_source = ""
+
+        if d.get("website_from_search_assist"):
+            override_website = d["website_from_search_assist"]
+            override_source = "search-assist"
+        elif d.get("website_from_linkedin"):
+            override_website = d["website_from_linkedin"]
+            override_source = "linkedin"
+
+        if override_website and override_website != website:
+            # Make sure it has a proper URL scheme
+            if not override_website.startswith("http"):
+                override_website = "https://" + override_website
+
+            self.log(f"      WEBSITE OVERRIDE: {website} -> {override_website} (source: {override_source})")
+            website = override_website
+            d["sources"].append(f"website-override:{override_source}")
+
+            # Re-crawl the official website for accurate contact data
+            self.log(f"      Re-crawling official website for contact details: {website}")
+            rp = await self.context.new_page()
+            try:
+                ok, rp = await self._goto(rp, website)
+                if ok:
+                    # Clear previously extracted emails/phones from wrong website
+                    old_emails = d["emails"][:]
+                    old_phones = d["phones"][:]
+                    d["emails"] = []
+                    d["phones"] = []
+                    d["about"] = ""
+                    d["contact"] = ""
+
+                    await self.extract_page(rp, d, "official-website")
+                    links = await self.same_domain_links(rp)
+
+                    # Crawl About/Contact pages on the official domain
+                    official_pages = [
+                        ("about", urljoin(website, "/about")),
+                        ("about", urljoin(website, "/about-us")),
+                        ("about", urljoin(website, "/company")),
+                        ("contact", urljoin(website, "/contact")),
+                        ("contact", urljoin(website, "/contact-us")),
+                    ]
+                    for href, text_link in links:
+                        t = normalize_text((text_link or "") + " " + href)
+                        typ = (
+                            "contact" if any(x in t for x in ("contact", "enquiry", "inquiry", "get in touch"))
+                            else "about" if any(x in t for x in ("about", "who we are", "company profile"))
+                            else ""
+                        )
+                        if typ:
+                            href_full = urljoin(website, href).rstrip("/")
+                            if root(href_full) == root(website):
+                                official_pages.append((typ, href_full))
+
+                    seen_urls = set()
+                    for typ, href in official_pages[:6]:
+                        href = href.rstrip("/")
+                        if href in seen_urls or root(href) != root(website):
+                            continue
+                        seen_urls.add(href)
+                        tab = await self.context.new_page()
+                        try:
+                            self.log(f"         Opening {typ} page: {href}")
+                            ok2, tab = await self._goto(tab, href)
+                            if ok2:
+                                if typ == "contact" and not d["contact"]:
+                                    d["contact"] = tab.url
+                                await asyncio.wait_for(
+                                    self.extract_page(tab, d, typ),
+                                    timeout=max(8, self.settings.browser_timeout_ms / 1000 + 3),
+                                )
+                        except Exception:
+                            pass
+                        finally:
+                            await self._close_page(tab)
+
+                    # If official website had no emails/phones, restore old ones
+                    if not d["emails"] and old_emails:
+                        d["emails"] = old_emails
+                    if not d["phones"] and old_phones:
+                        d["phones"] = old_phones
+
+            except Exception as exc:
+                self.log(f"      Official website re-crawl warning: {type(exc).__name__}: {str(exc)[:160]}")
+            finally:
+                await self._close_page(rp)
+
+        # ---- CONTACT DATA PRIORITY: Search Assist / LinkedIn over third-party ----
+        # If Search Assist or LinkedIn provided email/phone, prefer those.
+        if d["emails_from_search_assist"]:
+            d["emails"] = d["emails_from_search_assist"]
+            self.log(f"         Using Search Assist emails: {d['emails']}")
+        elif d["emails_from_linkedin"] and not d["emails"]:
+            d["emails"] = d["emails_from_linkedin"]
+            self.log(f"         Using LinkedIn emails: {d['emails']}")
+
+        if d["phones_from_search_assist"]:
+            d["phones"] = d["phones_from_search_assist"]
+            self.log(f"         Using Search Assist phones: {d['phones']}")
+        elif d["phones_from_linkedin"] and not d["phones"]:
+            d["phones"] = d["phones_from_linkedin"]
+            self.log(f"         Using LinkedIn phones: {d['phones']}")
 
         # Final validation before writing Excel.
         self._sanitize_classification(d)
@@ -1017,8 +1154,30 @@ class Researcher:
                 if m:
                     d["year"] = m.group(0)
                     d["sources"].append("year:linkedin")
+            # Extract official website from LinkedIn
+            elif n == "website" and i + 1 < len(lines):
+                next_line = lines[i + 1].strip()
+                if next_line.startswith("http") or "." in next_line:
+                    # Verify it's not a third-party aggregator
+                    li_website = next_line if next_line.startswith("http") else "https://" + next_line
+                    li_host = host(li_website)
+                    if not any(li_host == x or li_host.endswith("." + x) for x in IGNORED_HOSTS):
+                        d["website_from_linkedin"] = li_website
+                        d["sources"].append("website:linkedin")
             # LinkedIn "Specialties" are NOT the company's sector.
             # Keep them out of the Sector field to avoid false classifications.
+
+        # Extract LinkedIn emails/phones separately for priority override
+        for e in EMAIL_RE.findall(text):
+            cleaned = e.lower().rstrip(".,;")
+            if cleaned not in d.get("emails_from_linkedin", []):
+                d.setdefault("emails_from_linkedin", []).append(cleaned)
+        for ph in PHONE_RE.findall(text):
+            digits = re.sub(r"\D", "", ph)
+            if 8 <= len(digits) <= 15:
+                cleaned_phone = re.sub(r"\s+", " ", ph).strip()
+                if cleaned_phone not in d.get("phones_from_linkedin", []):
+                    d.setdefault("phones_from_linkedin", []).append(cleaned_phone)
 
         about = self.linkedin_about(text)
         if about and not d["about"]:

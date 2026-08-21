@@ -4,10 +4,31 @@ from company.normalizer import normalize_text, tokens
 
 LINKEDIN_HOSTS={"linkedin.com"}
 IGNORED_HOSTS={
+# Social media & developer platforms
 "github.com","facebook.com","instagram.com","youtube.com","x.com","twitter.com","threads.net","pinterest.com",
-"falconebiz.com","thecompanycheck.com","companydetails.in","indiafilings.com","tracxn.com","dnb.com","tofler.in","zaubacorp.com",
-"internshala.com","deepenrich.com","theorg.com","yappe.in","mahapage.com","eindiabusiness.com","justdial.com","indiamart.com","tradeindia.com",
-"crunchbase.com","glassdoor.com","ambitionbox.com"}
+# Indian business directories & aggregators
+"falconebiz.com","thecompanycheck.com","companydetails.in","indiafilings.com","tracxn.com","tofler.in","zaubacorp.com",
+"internshala.com","deepenrich.com","theorg.com","yappe.in","mahapage.com","eindiabusiness.com","justdial.com",
+"indiamart.com","tradeindia.com","crunchbase.com","glassdoor.com","ambitionbox.com",
+# Additional Indian business directories
+"exportersindia.com","go4worldbusiness.com","infyner.com","fundoodata.com","indiabizexpress.com",
+"bizprofile.in","grotal.com","sulekha.com","exportgenius.in","zauba.com",
+"indiancompanyinfo.com","companiesinindia.com","indiacompanyinfo.com","companyinfo.in",
+"indiabusiness.nic.in","mouthshut.com","dealstreetasia.com",
+# Fastener / niche directories that scrape company data
+"fastenersweb.com","about.me","opencorpdata.com",
+# Global business directories & aggregators
+"dnb.com","manta.com","yellowpages.com","yelp.com","bbb.org",
+"importgenius.com","panjiva.com","hoovers.com","owler.com","pitchbook.com",
+"bloomberg.com","reuters.com","forbes.com","inc.com",
+"zoominfo.com","apollo.io","clearbit.com","lusha.com","rocketreach.co",
+# Job / review portals
+"indeed.com","naukri.com","monsterindia.com","payscale.com","comparably.com",
+# Wikipedia / reference
+"wikipedia.org","wikidata.org",
+# Government / registration databases (not the company's own site)
+"mca.gov.in","roc.gov.in",
+}
 
 def host(u): return urlparse(u).netloc.lower().removeprefix("www.")
 def root(u):
